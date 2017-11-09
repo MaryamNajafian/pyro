@@ -105,7 +105,7 @@ class _Latent(object):
     """
     Base class for latent state containers.
     """
-    def __init__(self, address, replace=None):
+    def __init__(self, address='latent', replace=None):
         super(_Latent, self).__setattr__('_address', address)
         super(_Latent, self).__setattr__('_replace', replace)
 
@@ -221,9 +221,37 @@ class LatentList(_Latent, list):
             raise TypeError('LatentList cannot store objects of type {}'.format(type(value)))
         super(LatentList, self).__setitem__(pos, value)
 
+
+    def add(self):
+        pos = len(self)
+        address = '{}.[{}]'.format(self._address, pos)
+        value = Latent(address, lambda value: self.__setitem__(pos, value))
+        super(LatentList, self).append(value)
+        return value
+
     def append(self, value):
         pos = len(self)
         super(LatentList, self).append(None)
         self[pos] = value
 
     # TODO Make mutation methods safe.
+
+
+def lift(fn):
+    @functools.wraps(fn)
+    def decorated(*args, **kwargs):
+        if _CHECKING:
+            raise RuntimeError('@functions do not support recursion')
+        _CHECKING.append(None)
+        _PYRO_PENDING.clear()
+        _PYRO_BOUND.clear()
+        latent = Latent('latent')
+        try:
+            result = fn(latent, *args, **kwargs)
+        finally:
+            _CHECKING.pop()
+        if _PYRO_PENDING:
+            raise RuntimeError('\n'.join(['Unbound sites:'] + list(map(str, _PYRO_PENDING))))
+        return result
+
+    return decorated
