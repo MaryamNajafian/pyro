@@ -237,15 +237,26 @@ class LatentList(_Latent, list):
     # TODO Make mutation methods safe.
 
 
-def lift(fn):
+def condition(fn, data):
+    lifted_data = {}
+    for k, v in data.items():
+        lifted_data["latent." + k] = v
+    return lambda latent, *args, **kwargs: pyro.condition(lift(fn, latent), data)(*args, **kwargs)
+
+
+def lift(fn, _latent=None):
+    given = _latent is not None
     @functools.wraps(fn)
     def decorated(*args, **kwargs):
-        if _CHECKING:
-            raise RuntimeError('@functions do not support recursion')
+        # if _CHECKING:
+        #     raise RuntimeError('@functions do not support recursion')
         _CHECKING.append(None)
         _PYRO_PENDING.clear()
         _PYRO_BOUND.clear()
-        latent = Latent('latent')
+        if not given:
+            latent = Latent('latent')
+        else:
+            latent = _latent
         try:
             result = fn(latent, *args, **kwargs)
         finally:
@@ -255,3 +266,26 @@ def lift(fn):
         return result
 
     return decorated
+
+
+def SVI(model, guide, *args, **kwargs):
+    return pyro.infer.SVI(lift(model), lift(guide), *args, **kwargs)
+
+
+def Importance(model, guide=None, *args, **kwargs):
+    return pyro.infer.Importance(lift(model),
+                                 lift(guide) if guide is not None else None,
+                                 *args, **kwargs)
+
+def Search(model, *args, **kwargs):
+    return pyro.infer.Search(lift(model), *args, **kwargs)
+
+def Marginal(*args, **kwargs):
+    ret = pyro.infer.Marginal(*args, **kwargs)
+    def guess(*args, **kwargs):
+        d = ret(*args, **kwargs)
+        l = Latent("latent")
+        for k, v in d.items():
+            l.__setattr__(k[len("latent."):], v)
+        return l
+    return guess
