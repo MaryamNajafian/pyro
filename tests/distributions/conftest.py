@@ -9,7 +9,9 @@ import scipy.stats as sp
 import pyro.distributions as dist
 from pyro.distributions import (Bernoulli, Beta, Categorical, Cauchy, Dirichlet, Exponential, Gamma, HalfCauchy,
                                 LogNormal, Multinomial, Normal, Poisson, Uniform)
+import pyro.contrib.Concrete
 from tests.distributions.dist_fixture import Fixture
+
 
 continuous_dists = [
     Fixture(pyro_dist=(dist.uniform, Uniform),
@@ -121,6 +123,11 @@ continuous_dists = [
                  'test_data': [[1.0], [0.35]]}
             ],
             scipy_arg_fn=lambda mu, gamma: ((), {"loc": np.array(mu), "scale": np.array(gamma)})),
+    Fixture(pyro_dist=(pyro.contrib.Concrete.concrete, pyro.contrib.Concrete.Concrete),
+            examples=[
+                {'alpha': [0.1, 1], 'lambd': [1],
+                 'test_data': [0, 1]},
+            ])
 ]
 
 discrete_dists = [

@@ -18,6 +18,8 @@ from pyro.distributions.poisson import Poisson
 from pyro.distributions.random_primitive import RandomPrimitive
 from pyro.distributions.uniform import Uniform
 
+from pyro.distributions.concrete import Concrete
+
 # function aliases
 bernoulli = RandomPrimitive(Bernoulli)
 beta = RandomPrimitive(Beta)
