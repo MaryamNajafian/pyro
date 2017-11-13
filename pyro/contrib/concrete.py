@@ -98,12 +98,14 @@ class Concrete(Distribution):
         """
         n = self.event_shape()[0]
         alpha = self.alpha.expand(self.shape(x))
-        log_scale = Variable(log_gamma(torch.Tensor([n])) - np.log(self.lambd) * (-(n-1)))
+        print(self.shape(x))
+        log_scale = Variable(log_gamma(torch.Tensor([n]).expand(self.shape(x)))) - \
+                             self.lambd.log().mul(-(n-1))
         scores = x.log().mul(-self.lambd-1) + alpha.log()
         scores = scores.sum(dim=-1)
         log_part = n * alpha.mul(x.pow(-self.lambd)).sum(dim=-1).log()
         batch_log_pdf_shape = self.batch_shape(x) + (1,)
-        return (scores - log_part + log_scale).contiguous().view(batch_log_pdf_shape)
+        return (scores - log_part + log_scale).contiguous()
 
 
     def analytic_mean(self):
