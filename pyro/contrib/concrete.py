@@ -2,10 +2,11 @@ from __future__ import absolute_import, division, print_function
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.autograd import Variable
 
 from pyro.distributions.distribution import Distribution
-from pyro.distributions.util import softmax, log_gamma
+from pyro.distributions.util import log_gamma
 from pyro.distributions.random_primitive import RandomPrimitive
 
 class Concrete(Distribution):
@@ -17,10 +18,10 @@ class Concrete(Distribution):
 
     Implementation based on [1]
 
-    :param alpha: A vector of location parameters. These should be non-negative.
-    :type alpha: torch.autograd.Variable
     :param lambda_: Temperature parameter.
     :type lambda_: torch.autograd.Variable or scalar.
+    :param alpha: A vector of location parameters. These should be non-negative.
+    :type alpha: torch.autograd.Variable
     :param batch_size: Optional number of elements in the batch used to
         generate a sample. The batch dimension will be the leftmost dimension
         in the generated sample.
@@ -31,48 +32,51 @@ class Concrete(Distribution):
     """
     reparameterized = True
 
-    def __init__(self, alpha, lambd, batch_size=None, *args, **kwargs):
-        self.alpha = alpha
-        self.lambd = lambd
-        if alpha.dim() not in (1, 2):
-            raise ValueError("Parameter alpha must be either 1 or 2 dimensional.")
-        if alpha.dim() == 1 and batch_size is not None:
-            self.alpha = alpha.expand(batch_size, alpha.size(0))
+    def __init__(self, temperature, ps=None, logits=None, batch_size=None, log_pdf_mask=None, *args,
+                 **kwargs):
+        self.temperature = temperature
+        if (ps is None) == (logits is None):
+            raise ValueError("Got ps={}, logits={}. Either `ps` or `logits` must be specified, "
+                             "but not both.".format(ps, logits))
+        self.ps, self.logits = get_probs_and_logits(ps=ps, logits=logits, is_multidimensional=True)
+        self.log_pdf_mask = log_pdf_mask
+        if self.ps.dim() == 1 and batch_size is not None:
+            self.ps = self.ps.expand(batch_size, self.ps.size(0))
+            self.logits = self.logits.expand(batch_size, self.logits.size(0))
+            if log_pdf_mask is not None and log_pdf_mask.dim() == 1:
+                self.log_pdf_mask = log_pdf_mask.expand(batch_size, log_pdf_mask.size(0))
         super(Concrete, self).__init__(*args, **kwargs)
-
-    def _process_data(self, x):
-        if x is not None:
-            if isinstance(x, list):
-                x = np.array(x)
-            elif not isinstance(x, (Variable, torch.Tensor, np.ndarray)):
-                raise TypeError(("Data should be of type: list, Variable, Tensor, or numpy array"
-                                 "but was of {}".format(str(type(x)))))
-        return x
 
     def batch_shape(self, x=None):
         """
         Ref: :py:meth:`pyro.distributions.distribution.Distribution.batch_shape`
         """
         event_dim = 1
-        alpha = self.alpha
+        ps = self.ps
         if x is not None:
-            if x.size()[-event_dim] != alpha.size()[-event_dim]:
-                raise ValueError("The event size for the data and distribution parameters must match.\n"
-                                 "Expected x.size()[-1] == self.alpha.size()[-1], but got {} vs {}".format(
-                                     x.size(-1), alpha.size(-1)))
+            x = self._process_data(x)
+            x_shape = x.shape if isinstance(x, np.ndarray) else x.size()
             try:
-                alpha = self.alpha.expand_as(x)
+                ps = self.ps.expand(x_shape[:-event_dim] + self.event_shape())
             except RuntimeError as e:
-                raise ValueError("Parameter `alpha` with shape {} is not broadcastable to "
-                                 "the data shape {}. \nError: {}".format(alpha.size(), x.size(), str(e)))
-        return alpha.size()[:-event_dim]
+                raise ValueError("Parameter `ps` with shape {} is not broadcastable to "
+                                 "the data shape {}. \nError: {}".format(ps.size(), x.size(), str(e)))
+        return ps.size()[:-event_dim]
 
     def event_shape(self):
         """
         Ref: :py:meth:`pyro.distributions.distribution.Distribution.event_shape`
         """
-        return self.alpha.size()[-1:]
+        event_dim = 1
+        return self.ps.size()[-event_dim:]
 
+    def shape(self, x=None):
+        """
+        Ref: :py:meth:`pyro.distributions.distribution.Distribution.shape`
+        """
+        if self.one_hot:
+            return self.batch_shape(x) + self.event_shape()
+        return self.batch_shape(x) + (1,)
 
     def sample(self):
         """
@@ -81,12 +85,13 @@ class Concrete(Distribution):
         """
 
         # Sample Gumbels, G_k = -log(-log(U))
-        n = self.event_shape()
-        gumbel = Variable(torch.rand(n).type_as(self.alpha.data)
-                          .log().mul(-1).log().mul(-1))
+        uniforms = torch.zeros(self.logits.data.size()).uniform_()
+        eps = _get_clamping_buffer(uniforms)
+        uniforms = uniforms.clamp(min=eps, max=1-eps)
+        gumbels = Variable(uniforms.log().mul(-1).log().mul(-1))
 
         # Reparameterize
-        z = softmax((self.alpha.log() + gumbel) / self.lambd)
+        z = F.logsoftmax((self.alpha.log() + gumbels) / self.temperature)
         return z if self.reparameterized else z.detach()
 
     def batch_log_pdf(self, x):
@@ -97,21 +102,31 @@ class Concrete(Distribution):
         :rtype: torch.autograd.Variable
         """
         n = self.event_shape()[0]
-        alpha = self.alpha.expand(self.shape(x))
-        print(self.shape(x))
+        logits = self.logits.expand(self.shape(x))
         log_scale = Variable(log_gamma(torch.Tensor([n]).expand(self.shape(x)))) - \
-                             self.lambd.log().mul(-(n-1))
-        scores = x.log().mul(-self.lambd-1) + alpha.log()
+                             self.temperature.log().mul(-(n-1))
+        scores = logits.log() + x.mul(-self.temperature)
         scores = scores.sum(dim=-1)
-        log_part = n * alpha.mul(x.pow(-self.lambd)).sum(dim=-1).log()
-        batch_log_pdf_shape = self.batch_shape(x) + (1,)
+
+        log_part = n * logits.mul(x.mul(-self.temperature).exp()).sum(dim=-1).log()
         return (scores - log_part + log_scale).contiguous()
 
-
-    def analytic_mean(self):
-        """
-        Ref: :py:meth:`pyro.distributions.distribution.Distribution.analytic_mean`
-        """
-        return self.alpha
-
 concrete = RandomPrimitive(Concrete)
+
+class Exp(Bijector):
+    def __init__(self):
+        super(Exp, self).__init__()
+
+    def __call__(self, x, *args, **kwargs):
+        return torch.exp(x)
+
+    def inverse(self, y, *args, **kwargs):
+        eps = _get_clamping_buffer(y)
+        return torch.log(y.clamp(min=eps))
+
+    def log_det_jacobian(self, y, *args, **kwargs):
+        return y.sum().abs()
+
+class RelaxedCatergorical(Distribution):
+    def __new__(cls, *args, **kwargs):
+        return TransformedDistribution(RelaxedExpCategorical(*args, **kwargs), Exp())
